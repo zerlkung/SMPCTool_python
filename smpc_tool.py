@@ -879,37 +879,46 @@ def cmd_loc_convert(args):
     """
     Convert .localization asset between PC and PS4 format.
     PC  -> PS4 : strip PC header (0x24 bytes), prepend PS4 magic (0xBA20AFB5)
-    PS4 -> PC  : strip PS4 magic (4 bytes), prepend PC header with asset_id from --asset-id
-    Auto-detect if --mode not specified.
+    PS4 -> PC  : strip PS4 magic (4 bytes), prepend PC header
+    Auto-detect direction from file magic if --mode not specified.
 
-    PC format (in archive): 0x122BB0AB + rawsize + 0x1C zeros + DAT1
-    PC format (extracted) : DAT1 directly
-    PS4 format            : 0xBA20AFB5 + DAT1
+    Output path rules (when --output is omitted):
+      PC/DAT1  → appends .ps4   e.g.  localization_all.localization.ps4
+      PS4      → appends .pc    e.g.  localization_all.localization.pc
+    When --output is given, that path is used as-is.
     """
-    with open(args.asset,'rb') as f: data = f.read()
+    with open(args.asset, 'rb') as f: data = f.read()
     magic = struct.unpack_from('<I', data, 0)[0]
 
-    mode = getattr(args,'mode',None)
+    mode = getattr(args, 'mode', None)
     if not mode:
-        if magic == PC_ASSET_MAGIC: mode = 'pc2ps4'
-        elif magic == PS4_ASSET_MAGIC: mode = 'ps42pc'
-        elif magic == DAT1_MAGIC: mode = 'pc2ps4'  # raw extracted PC file
-        else: raise ValueError(f"Cannot auto-detect format (magic={magic:#010x}). Use --mode.")
+        if magic in (PC_ASSET_MAGIC, DAT1_MAGIC):
+            mode = 'pc2ps4'
+        elif magic == PS4_ASSET_MAGIC:
+            mode = 'ps42pc'
+        else:
+            raise ValueError(f"Cannot auto-detect format (magic={magic:#010x}). Use --mode.")
+
+    # Determine output path: explicit > auto-suffix
+    out_path = getattr(args, 'output', None) or ''
+    if not out_path:
+        suffix = '.ps4' if mode == 'pc2ps4' else '.pc'
+        out_path = args.asset + suffix
 
     if mode == 'pc2ps4':
         dat1, _ = _get_dat1_from_asset(data)
         out_data = struct.pack('<I', PS4_ASSET_MAGIC) + dat1
-        print(f"Converted PC -> PS4 ({len(data):,} -> {len(out_data):,} bytes) -> {args.output}")
+        label = 'PC -> PS4'
     elif mode == 'ps42pc':
         dat1, _ = _get_dat1_from_asset(data)
-        asset_id_raw = int(getattr(args,'asset_id','0') or '0', 0)
-        hdr = struct.pack('<I', PC_ASSET_MAGIC) + struct.pack('<I', len(dat1)) + b'\x00'*28
+        hdr = struct.pack('<I', PC_ASSET_MAGIC) + struct.pack('<I', len(dat1)) + b'\x00' * 28
         out_data = hdr + dat1
-        print(f"Converted PS4 -> PC ({len(data):,} -> {len(out_data):,} bytes) -> {args.output}")
+        label = 'PS4 -> PC'
     else:
         raise ValueError(f"Unknown mode: {mode}")
 
-    with open(args.output,'wb') as f: f.write(out_data)
+    with open(out_path, 'wb') as f: f.write(out_data)
+    print(f"Converted {label} ({len(data):,} -> {len(out_data):,} bytes) -> {out_path}")
 
 
 def cmd_dump_archive(args):
@@ -952,7 +961,9 @@ examples:
                     --output-archive patch_new.archive --output-toc toc_new
   %(prog)s loc-export  --asset localization_all.localization --output strings.csv
   %(prog)s loc-import  --asset localization_all.localization --csv strings_th.csv --output loc_th.localization
-  %(prog)s loc-convert --asset localization_all.localization --output loc_ps4.localization
+  %(prog)s loc-convert --asset localization_all.localization            # -> localization_all.localization.ps4
+  %(prog)s loc-convert --asset localization_all.localization.ps4        # -> localization_all.localization.ps4.pc
+  %(prog)s loc-convert --asset localization_all.localization --output custom_name.localization
         """
     )
 
@@ -1015,11 +1026,12 @@ examples:
     s = sub.add_parser('loc-convert',
         help='Convert .localization between PC and PS4 format (auto-detect)')
     s.add_argument('--asset',    required=True)
-    s.add_argument('--output',   required=True)
+    s.add_argument('--output',   default='',
+                   help='Output path (default: <asset>.ps4 or <asset>.pc)')
     s.add_argument('--mode',     choices=['pc2ps4','ps42pc'],
                    help='Conversion direction (auto-detected if omitted)')
     s.add_argument('--asset-id', default='0', metavar='HEX',
-                   help='Asset ID for ps42pc conversion (hex, optional)')
+                   help='Asset ID for ps42pc (hex, optional)')
 
     s = sub.add_parser('dump-archive', help='Hexdump bytes from archive (debug)')
     s.add_argument('--archive', required=True)
