@@ -1,28 +1,29 @@
-# SMPCTool Python
+# SMPCTool Python — v3.0
 
 Python port ของ [SMPCTool](https://github.com/Phew/SMPCTool-src) สำหรับ Marvel's Spider-Man Remastered / Spider-Man 2 บน PC
 
-Pure Python 3 ไม่ต้องติดตั้ง library เพิ่มเติม รองรับทุก platform ที่รัน Python 3 ได้
+Pure Python 3 ไม่ต้องติดตั้ง library เพิ่มเติม
 
 ---
 
-## คำสั่งที่รองรับ
+## คำสั่งทั้งหมด
 
 ```
 positional arguments:
-  {build-hashdb,info,list,extract,repack,repack-dir,csv,hash,dag,loc-export,loc-import,dump-archive}
+  {build-hashdb,info,list,extract,repack,patch,csv,hash,dag,loc-export,loc-import,loc-convert,dump-archive}
     build-hashdb   สร้าง hash DB จากไฟล์ dag  ← รันก่อนเป็นอันดับแรก!
-    info           แสดงสรุป TOC (archive ทั้งหมด + จำนวน asset)
-    list           แสดงรายการ asset
+    info           แสดงสรุป TOC (archives + จำนวน asset)
+    list           แสดงรายการ asset (กรองด้วย --filter, --archive)
     extract        แตก asset จาก archive
-    repack         Rebuild archive + TOC ใหม่ (สำหรับ modding)
-    repack-dir     Repack จากโฟลเดอร์ที่แตกออกมา (รองรับ lang suffix)
+    repack         Rebuild archive + TOC ใหม่ทั้งหมด
+    patch          สร้าง patch.archive จากไฟล์ที่แก้ไข (เร็วกว่า repack)
     csv            Export รายการ asset เป็น CSV
     hash           คำนวณ CRC-64 hash จาก path string
-    dag            ค้นหาชื่อ asset ใน DAG หรือ export รายการทั้งหมด
-    loc-export     Export .localization asset เป็น CSV สำหรับแปล
-    loc-import     นำ CSV ที่แปลแล้วกลับเป็น .localization asset
-    dump-archive   Hexdump ข้อมูลดิบจาก archive (สำหรับ debug)
+    dag            ค้นหา / export ชื่อ asset จาก DAG
+    loc-export     Export .localization -> CSV (key, source, translation)
+    loc-import     Import CSV ที่แปลแล้ว -> .localization
+    loc-convert    แปลง .localization ระหว่าง PC และ PS4 format
+    dump-archive   Hexdump ข้อมูลดิบจาก archive (debug)
 
 options:
   --toc TOC
@@ -33,155 +34,146 @@ options:
 
 ## เริ่มต้นใช้งาน
 
-### 1. เตรียม hash DB (ชื่อ asset)
+### 1. เตรียม Hash DB
 
-**วิธีที่ 1 (แนะนำ):** ดาวน์โหลด `AssetHashes.txt` จาก [Phew/SMPCTool-src](https://github.com/Phew/SMPCTool-src) (ไฟล์ 48 MB)
-ครอบคลุม ~212,921 asset จาก 771,677 ทั้งหมด (30%)
+ดาวน์โหลด `AssetHashes.txt` จาก [Phew/SMPCTool-src](https://github.com/Phew/SMPCTool-src) (48 MB)
+ครอบคลุม ~238,000 asset จาก 771,000+ ทั้งหมด
 
-**วิธีที่ 2:** สร้างจาก DAG เอง (ได้ชื่อประมาณ 415,100 รายการ แต่อาจ match กับ TOC ได้น้อยกว่า)
+หรือสร้างเองจาก DAG:
 ```bash
 python smpc_tool.py build-hashdb --dag dag --output hashdb.txt
 ```
 
-### 2. ดู TOC summary
+### 2. ดูข้อมูล TOC
+
 ```bash
 python smpc_tool.py info --toc toc --hashdb AssetHashes.txt
 ```
 
-### 3. แสดงรายการ asset
+### 3. ค้นหา asset
+
 ```bash
-# ดูทุก asset ใน archive
-python smpc_tool.py list --toc toc --hashdb AssetHashes.txt --archive g00s000
-
-# กรองตามชื่อ
-python smpc_tool.py list --toc toc --hashdb AssetHashes.txt --filter .texture
-
-# กรองตาม archive + ชื่อ
-python smpc_tool.py list --toc toc --hashdb AssetHashes.txt --archive g00s000 --filter spider_man
+python smpc_tool.py list --toc toc --hashdb AssetHashes.txt --filter localization
+python smpc_tool.py list --toc toc --hashdb AssetHashes.txt --archive patch.archive
 ```
 
 ### 4. แตก asset
-```bash
-# แตกทุก asset จาก archive
-python smpc_tool.py extract \
-  --toc toc \
-  --archive-dir asset_archive \
-  --archive g00s000 \
-  --output out/ \
-  --hashdb AssetHashes.txt
 
-# แตกเฉพาะ asset ที่มีชื่อ (ข้าม hex ID)
-python smpc_tool.py extract ... --skip-hex
+```bash
+python smpc_tool.py extract \
+  --toc toc --archive-dir asset_archive \
+  --archive patch.archive --output out/ \
+  --hashdb AssetHashes.txt
 ```
 
-### 5. Repack (สำหรับ modding)
-```bash
-# Rebuild archive จากไฟล์ต้นฉบับ
-python smpc_tool.py repack \
-  --toc toc \
-  --archive-dir asset_archive \
-  --archive patch.archive \
-  --output-archive patch_new.archive \
-  --output-toc toc_new \
-  --hashdb AssetHashes.txt
+---
 
-# Repack จากโฟลเดอร์ที่แก้ไขแล้ว
-# (แทนที่ด้วยไฟล์ใหม่ ส่วนที่ไม่มีในโฟลเดอร์จะใช้ไฟล์ต้นฉบับ)
-python smpc_tool.py repack-dir \
+## Modding Workflow
+
+### วิธีที่ 1: patch (แนะนำ — เร็วกว่า)
+
+สร้าง `patch.archive` ใหม่จากไฟล์ที่แก้ไขเท่านั้น
+
+```bash
+python smpc_tool.py patch \
   --toc toc \
+  --hashdb AssetHashes.txt \
   --archive-dir asset_archive \
-  --src-dir out/ \
-  --archive patch.archive \
+  --replace "localization/localization_all.localization:my_translation.localization" \
   --output-archive patch_new.archive \
-  --output-toc toc_new \
-  --hashdb AssetHashes.txt
+  --output-toc toc_new
+```
+
+วาง `patch_new.archive` และ `toc_new` ลงในโฟลเดอร์ `asset_archive` (backup ไฟล์เดิมก่อน!)
+
+### วิธีที่ 2: repack (rebuild ทั้ง archive)
+
+```bash
+python smpc_tool.py repack \
+  --toc toc --archive-dir asset_archive \
+  --archive patch.archive \
+  --output-archive patch_new.archive --output-toc toc_new
 ```
 
 ---
 
 ## ระบบแปลภาษา (Localization)
 
-ไฟล์ `.localization` เก็บ string ทั้งหมดที่แสดงใน UI เกม (ชื่อ mission, คำอธิบาย accessibility, dialog ฯลฯ)
+### Export เพื่อแปล
 
-### Export เป็น CSV สำหรับแปล
 ```bash
-# 1. แตก localization asset ออกมาก่อน
+# 1. แตกไฟล์ localization ออกมาก่อน
 python smpc_tool.py extract \
   --toc toc --archive-dir asset_archive \
-  --archive patch.archive --output out/ \
-  --hashdb AssetHashes.txt
+  --archive patch.archive --output out/ --hashdb AssetHashes.txt
 
-# 2. Export เป็น CSV
+# 2. Export เป็น CSV (3 คอลัมน์: key, source, translation)
 python smpc_tool.py loc-export \
   --asset "out/localization/localization_all.localization" \
-  --output strings_en.csv
+  --output strings.csv
 ```
 
-CSV จะมี 2 คอลัมน์:
-| key | value |
-|-----|-------|
-| ABANDON_CONFIRM_BODY | Abandoning a mission will result in... |
-| ABANDON_CONFIRM_HEADER | ARE YOU SURE? |
-| ... | ... |
+CSV format เหมือนกับ [team-waldo/InsomniacArchive](https://github.com/team-waldo/InsomniacArchive):
+| key | source | translation |
+|-----|--------|-------------|
+| ABANDON_CONFIRM_BODY | Abandoning a mission... | ยกเลิก... |
+| ABANDON_CONFIRM_HEADER | ARE YOU SURE? | แน่ใจไหม? |
 
-### Import CSV ที่แปลแล้ว
+### Import คำแปล
+
 ```bash
+# เติมคอลัมน์ 'translation' ใน CSV แล้ว import กลับ
 python smpc_tool.py loc-import \
   --asset "out/localization/localization_all.localization" \
   --csv strings_th.csv \
-  --output localization_all_th.localization
-```
+  --output localization_th.localization
 
-### นำไฟล์แปลกลับเข้าเกม
-```bash
-# สร้าง archive ใหม่ด้วยไฟล์แปลที่แก้ไข
-python smpc_tool.py repack-dir \
-  --toc toc \
+# Apply ลงในเกมด้วย patch
+python smpc_tool.py patch \
+  --toc toc --hashdb AssetHashes.txt \
   --archive-dir asset_archive \
-  --src-dir out/ \
-  --archive patch.archive \
-  --output-archive patch_translated.archive \
-  --output-toc toc_translated \
-  --hashdb AssetHashes.txt
+  --replace "localization/localization_all.localization:localization_th.localization" \
+  --output-archive patch_th.archive --output-toc toc_th
+```
 
-# วาง patch_translated.archive และ toc_translated ลงในโฟลเดอร์ asset_archive
-# (backup ไฟล์เดิมก่อน!)
+### แปลงระหว่าง PC และ PS4
+
+```bash
+# PC extracted -> PS4 format (auto-detect)
+python smpc_tool.py loc-convert \
+  --asset localization_all.localization \
+  --output localization_ps4.localization
+
+# PS4 -> PC (ระบุ mode ชัดเจน)
+python smpc_tool.py loc-convert \
+  --asset localization_ps4.localization \
+  --output localization_pc.localization \
+  --mode ps42pc
 ```
 
 ---
 
-## รูปแบบ Hash DB
-
-รองรับ 2 format อัตโนมัติ:
-
-| Format | ตัวอย่าง | ที่มา |
-|--------|----------|-------|
-| C# SMPCTool | `path\to\asset.model,9223384287010557067` | `AssetHashes.txt` จาก Phew/SMPCTool-src |
-| Tab-separated | `0x800035f1ebdcbcec	path/to/asset.model` | สร้างด้วย `build-hashdb` |
-
----
-
-## รายละเอียด Format ไฟล์ PC
+## รูปแบบไฟล์ PC (เทียบกับ PS4)
 
 | Component | PS4 | PC |
-|-----------|-----|-----|
+|-----------|-----|----|
 | TOC magic | `0xAF12AF77` | เหมือนกัน |
 | TOC compression | Single zlib via `decompressobj` | เหมือนกัน |
-| Archive entry stride | 24 bytes | **72 bytes** |
-| Archive magic | `0xBA20AFB5` | **`0x122BB0AB`** |
-| Archive format | Raw binary | 36-byte PC wrapper + raw DAT1 |
-| Archive compression | Raw | ไม่ compress (patch); custom LZ (g-archives) |
+| Archive stride | 24 bytes | **72 bytes** |
+| Asset wrapper | `0xBA20AFB5` + DAT1 | `0x122BB0AB` + size + pad(28) + DAT1 |
+| patch.archive entry | — | flag=2, unk04=0xCCCC |
 | DAG magic | `0x891F77AF` | เหมือนกัน |
-| DAG string offset | 102 | **88** |
-| Asset ID scheme | CRC-64 hash | Mixed: CRC-64 (30%) + structured 0xe0 IDs (70%) |
+| DAG strings | offset 102 | **offset 88** |
 
-### โครงสร้าง .localization asset (DAT1)
-| Section hash | เนื้อหา |
-|---|---|
-| `0x4d73cebd` | String keys (ASCII, null-terminated) |
-| `0x70a382b8` | Translated values (UTF-8, null-terminated) |
-| `0xf80deeb4` | Value offset table (1 uint32 per key) |
-| `0xd540a903` | Key count (4 bytes) |
+### Localization sections (DAT1)
+
+| Section hash | ชื่อ | เนื้อหา |
+|---|---|---|
+| `0x4d73cebd` | KeyDataSection | key string blob (ASCII) |
+| `0xa4ea55b2` | KeyOffsetSection | int[] offset ของแต่ละ key |
+| `0x70a382b8` | TranslationDataSection | value string blob (UTF-8) |
+| `0xf80deeb4` | TranslationOffsetSection | int[] offset ของแต่ละ value |
+| `0xd540a903` | — | key count (4 bytes) |
 
 ---
 
@@ -189,5 +181,6 @@ python smpc_tool.py repack-dir \
 
 - **C# SMPCTool ต้นฉบับ (PC)**: [Phew/SMPCTool-src](https://github.com/Phew/SMPCTool-src) — Phew
 - **AssetHashes.txt**: [Phew/SMPCTool-src](https://github.com/Phew/SMPCTool-src)
+- **Format spec + Localization + Patch logic**: [team-waldo/InsomniacArchive](https://github.com/team-waldo/InsomniacArchive)
 - **PS4 Python port ที่ใช้ต่อยอด**: [zerlkung/SMPCTool-PS4_python](https://github.com/zerlkung/SMPCTool-PS4_python) — zerlkung
-- **C# PS4 fork ที่เป็นแรงบันดาลใจ**: [zerlkung/SMPCTool-PS4](https://github.com/zerlkung/SMPCTool-PS4)
+- **C# PS4 original**: [zerlkung/SMPCTool-PS4](https://github.com/zerlkung/SMPCTool-PS4)

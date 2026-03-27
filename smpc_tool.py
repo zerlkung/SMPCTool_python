@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 """
-SMPCTool Python — PC Version v2.1
+SMPCTool Python — PC Version v3.0
 Marvel's Spider-Man Remastered / Spider-Man 2 PC asset tool.
 Pure Python 3, zero dependencies.
 
-Adapted from SMPS4Tool v2 (PS4) with format details confirmed from
-binary analysis of actual PC game files (toc, dag, patch.archive)
-and cross-referenced with Phew/SMPCTool-src (C# original for PC).
+อ้างอิงจาก:
+  - Phew/SMPCTool-src  (C# original PC tool + AssetHashes.txt)
+  - team-waldo/InsomniacArchive  (format spec + localization + patch logic)
+  - Binary analysis ของไฟล์เกมจริง (toc, dag, patch.archive)
 
-ข้อมูล Format PC ที่ยืนยันแล้ว:
-  TOC       : Single zlib stream จาก byte 8 (ใช้ decompressobj)
-  Archive   : 36-byte PC wrapper + raw DAT1 payload (ไม่ compress)
-  Archive   : magic 0x122BB0AB (PC), stride 72 bytes per entry
-  DAG       : magic 0x891F77AF, strings เริ่มที่ byte 88
-  Loc asset : sec[2]=keys, sec[3]=values(UTF-8), sec[8]=offsets
-
-ดู README.md สำหรับรายละเอียดเพิ่มเติม
+ข้อมูล format PC ที่ยืนยันแล้ว:
+  TOC        : magic 0xAF12AF77, single zlib via decompressobj, DAT1 header offset 16
+  Archive    : AssetId(4)+rawsize(4)+pad(0x1C)+DAT1  หรือ  raw binary ไม่มี header
+  Archive    : stride 72 bytes/entry, flag=2 = patch archive
+  Localization: KeyOffsetSection(0xa4ea55b2) → KeyDataSection(0x4d73cebd)
+                TranslationOffsetSection(0xf80deeb4) → TranslationDataSection(0x70a382b8)
+  Patch      : สร้าง patch.archive ใหม่ + update TOC offsets (ไม่ต้อง repack ทั้ง archive)
 """
 
 import argparse
@@ -29,25 +29,40 @@ from collections import defaultdict
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
+TOC_MAGIC       = 0xAF12AF77
+DAT1_MAGIC      = 0x44415431   # b'DAT1'
+PC_ASSET_MAGIC  = 0x122BB0AB   # PC archive wrapper (LE)
+PS4_ASSET_MAGIC = 0xBA20AFB5   # PS4 asset wrapper (LE)
+PC_HEADER_SIZE  = 0x24         # 36 bytes: AssetId(4)+rawsize(4)+pad(28)
+ARCH_STRIDE     = 72           # bytes per ArchiveFileEntry
+DAG_MAGIC       = 0x891F77AF
+DAG_STR_OFFSET  = 88
 
-TOC_MAGIC      = 0xAF12AF77
-DAT1_MAGIC     = 0x44415431
-PC_ASSET_MAGIC = 0x122BB0AB
-PC_HEADER_SIZE = 36
-ARCH_STRIDE    = 72
-DAG_MAGIC      = 0x891F77AF
-DAG_STR_OFFSET = 88
+# TOC section IDs (from TocFile.cs / binary analysis)
+SEC_ARCH_FILES  = 0x398abff0   # ArchiveFileEntry[]
+SEC_NAME_HASH   = 0x506d7b8a   # ulong[] AssetIDs
+SEC_FILE_CHUNK  = 0x65bcf461   # FileChunkDataEntry[] = SizeEntries
+SEC_KEY_ASSET   = 0x6d921d7b   # ulong[] KeyAssets
+SEC_CHUNK_INFO  = 0xdcd720b5   # ChunkInfoEntry[] = OffsetEntries
+SEC_SPAN        = 0xede8ada9   # SpanEntry[] = ArchiveTOC
 
-# Localization DAT1 section hashes (confirmed from patch.archive)
-LOC_SEC_KEYS    = 0x4d73cebd  # ASCII key strings
-LOC_SEC_VALUES  = 0x70a382b8  # UTF-8 translated value strings
-LOC_SEC_OFFSETS = 0xf80deeb4  # uint32 per-key offset into value section
-LOC_SEC_COUNT   = 0xd540a903  # 4-byte key count
+# Localization section IDs (from LocalizationFile.cs)
+LOC_KEY_DATA    = 0x4d73cebd   # key string blob
+LOC_KEY_OFF     = 0xa4ea55b2   # int[] offsets into key blob
+LOC_VAL_DATA    = 0x70a382b8   # value string blob (UTF-8)
+LOC_VAL_OFF     = 0xf80deeb4   # int[] offsets into value blob
+LOC_COUNT       = 0xd540a903   # int  key count
+
+LOC_SIGNATURE   = "Localization Built File"
+
+# New patch archive entry fields (from ArchiveDirectory.SaveArchives())
+PATCH_FLAG  = 0x0002
+PATCH_UNK04 = 0xCCCC
+PATCH_UNK06 = 0x0001
 
 # ---------------------------------------------------------------------------
-# CRC-64 (Insomniac) — best-effort matching; use AssetHashes.txt for coverage
+# CRC-64 (Insomniac) — Crc64.HashPath from InsomniacArchive/Hash/Crc64.cs
 # ---------------------------------------------------------------------------
-
 def _build_crc64():
     POLY = 0xAD93D23594C935A9
     t = []
@@ -60,29 +75,26 @@ def _build_crc64():
 
 _CRC64 = _build_crc64()
 
-
 def compute_hash(path):
-    norm, prev_slash = [], False
+    norm, prev = [], False
     for ch in path:
         c = ord(ch)
         if 0x41 <= c <= 0x5A: c += 0x20
         if c == 0x5C: c = 0x2F
         if c == 0x2F:
-            if not prev_slash: norm.append(c)
-            prev_slash = True
+            if not prev: norm.append(c)
+            prev = True
         else:
-            norm.append(c); prev_slash = False
+            norm.append(c); prev = False
     crc = 0xC96C5795D7870F42
     for b in norm:
         crc = _CRC64[(crc ^ b) & 0xFF] ^ (crc >> 8)
         crc &= 0xFFFFFFFFFFFFFFFF
     return ((crc >> 2) | 0x8000000000000000) & 0xFFFFFFFFFFFFFFFF
 
-
 # ---------------------------------------------------------------------------
-# TOC
+# TOC compression
 # ---------------------------------------------------------------------------
-
 def _toc_decompress(raw):
     if struct.unpack_from('>I', raw, 0)[0] != TOC_MAGIC:
         raise ValueError(f"Bad TOC magic: {struct.unpack_from('>I',raw,0)[0]:#010x}")
@@ -90,17 +102,18 @@ def _toc_decompress(raw):
     dec = zlib.decompressobj().decompress(raw[8:])
     return dec[:expected] if len(dec) != expected else dec
 
-
 def _toc_compress(dec):
     return struct.pack('>I', TOC_MAGIC) + struct.pack('<I', len(dec)) + zlib.compress(dec, 9)
 
-
+# ---------------------------------------------------------------------------
+# TOC parser — using section IDs from TocFile.cs
+# ---------------------------------------------------------------------------
 class AssetEntry:
-    __slots__ = ('asset_id', 'filename', 'file_size', 'archive_index',
-                 'archive_offset', '_ai_toc', '_ao_toc', '_sz_toc')
+    __slots__ = ('asset_id','filename','file_size','archive_index','archive_offset',
+                 '_ai_toc','_ao_toc','_sz_toc','_toc_idx')
     def __init__(self):
         self.asset_id = self.file_size = self.archive_index = 0
-        self.archive_offset = self._ai_toc = self._ao_toc = self._sz_toc = 0
+        self.archive_offset = self._ai_toc = self._ao_toc = self._sz_toc = self._toc_idx = 0
         self.filename = ''
     def __repr__(self):
         return f'<Asset {self.asset_id:#018x} {self.filename!r} arch={self.archive_index} off={self.archive_offset:#x} sz={self.file_size}>'
@@ -108,9 +121,11 @@ class AssetEntry:
 
 class TOC:
     def __init__(self):
-        self.archives = []
-        self.assets   = []
+        self.archives = []    # list[str]
+        self.assets   = []    # list[AssetEntry]
         self.dec_data = b''
+        # Raw section data for in-place patching
+        self._secs = {}       # hash -> (offset, size) in dec_data
 
     @classmethod
     def load(cls, path, hashdb=None):
@@ -124,61 +139,141 @@ class TOC:
         dec = self.dec_data
         if struct.unpack_from('<I', dec, 0)[0] != DAT1_MAGIC:
             raise ValueError("Bad DAT1 magic in TOC")
-        n = struct.unpack_from('<I', dec, 12)[0]
-        if n != 6:
-            raise ValueError(f"Expected 6 TOC sections, got {n}")
-        secs = [struct.unpack_from('<III', dec, 16 + i*12) for i in range(6)]
+        nsec = struct.unpack_from('<I', dec, 12)[0]
 
-        # Identify sections by size relationships
-        archtoc   = next((s for s in secs if s[2] == 2048), None)
-        archfiles = min((s for s in secs if s[2] % ARCH_STRIDE == 0 and s[2] < 200_000), key=lambda s: s[2], default=None)
-        n8s       = {s[2]//8 for s in secs if s[2] % 8 == 0 and s[2] > 100_000}
-        sizeent   = next((s for s in secs if s[2] % 12 == 0 and (s[2]//12) in n8s and s[2] > 100_000), None)
-        n_assets  = sizeent[2] // 12 if sizeent else 0
-        large8    = [s for s in secs if s[2] == n_assets * 8 and s[2] > 100_000]
-        assetids = offsetent = None
-        if len(large8) == 2:
-            for s in large8:
-                (offsetent if struct.unpack_from('<I', dec, s[1])[0] < 256 else assetids).__class__  # dummy
-            a, b = large8
-            if struct.unpack_from('<I', dec, a[1])[0] < 256: offsetent, assetids = a, b
-            else:                                              assetids, offsetent = a, b
-        elif large8: assetids = large8[0]
+        self._secs = {}
+        for i in range(nsec):
+            base = 16 + i*12
+            h = struct.unpack_from('<I', dec, base)[0]
+            o = struct.unpack_from('<I', dec, base+4)[0]
+            s = struct.unpack_from('<I', dec, base+8)[0]
+            self._secs[h] = (o, s)
 
-        if not (archfiles and assetids and sizeent and offsetent):
-            raise ValueError("Cannot identify required TOC sections")
+        arch_off, arch_sz  = self._secs[SEC_ARCH_FILES]
+        asid_off, _        = self._secs[SEC_NAME_HASH]
+        size_off, size_sz  = self._secs[SEC_FILE_CHUNK]
+        oe_off,   _        = self._secs[SEC_CHUNK_INFO]
 
-        arch_off = archfiles[1]; asid_off = assetids[1]
-        size_off = sizeent[1];   oe_off   = offsetent[1]
-
+        # Archives
+        n_arch = arch_sz // ARCH_STRIDE
         self.archives = []
-        for i in range(archfiles[2] // ARCH_STRIDE):
+        for i in range(n_arch):
             e = dec[arch_off + i*ARCH_STRIDE : arch_off + (i+1)*ARCH_STRIDE]
-            self.archives.append(e[8:].split(b'\x00')[0].decode('ascii', 'replace'))
+            self.archives.append(e[8:].split(b'\x00')[0].decode('ascii','replace'))
 
+        # Assets
+        n_assets = size_sz // 12
         self.assets = []
         for i in range(n_assets):
             aid = struct.unpack_from('<Q', dec, asid_off + i*8)[0]
             sp  = size_off + i*12
-            _, fsz, oe_i = struct.unpack_from('<III', dec, sp)
-            op = oe_off + oe_i*8
-            ai, ao = struct.unpack_from('<II', dec, op)
+            chunk_count, total_size, chunk_idx = struct.unpack_from('<III', dec, sp)
+            op  = oe_off + chunk_idx*8
+            arch_idx = struct.unpack_from('<I', dec, op)[0]
+            arch_off_ = struct.unpack_from('<I', dec, op+4)[0]
+
             a = AssetEntry()
-            a.asset_id = aid; a.filename = hashdb.get(aid, f'{aid:#018x}')
-            a.file_size = fsz; a.archive_index = ai; a.archive_offset = ao
-            a._ai_toc = op; a._ao_toc = op + 4; a._sz_toc = sp + 4
+            a.asset_id       = aid
+            a.filename       = hashdb.get(aid, f'{aid:#018x}')
+            a.file_size      = total_size
+            a.archive_index  = arch_idx
+            a.archive_offset = arch_off_
+            a._toc_idx       = i
+            a._ai_toc        = op        # ChunkInfoEntry.archiveFileNo
+            a._ao_toc        = op + 4    # ChunkInfoEntry.offset
+            a._sz_toc        = sp + 4    # FileChunkDataEntry.totalSize
             self.assets.append(a)
 
     def by_archive(self, name):
         idxs = {i for i, n in enumerate(self.archives) if n == name}
         return [a for a in self.assets if a.archive_index in idxs]
 
-    def patch_redirect(self, asset, new_idx, new_off, new_sz):
+    def find_by_filename(self, filename):
+        """Find all assets matching a filename (supports partial match)."""
+        fl = filename.lower().replace('\\','/')
+        return [a for a in self.assets if fl in a.filename.lower().replace('\\','/')]
+
+    def find_by_id(self, asset_id):
+        return [a for a in self.assets if a.asset_id == asset_id]
+
+    def patch_asset(self, asset, new_arch_idx, new_offset, new_size):
+        """Update TOC in-place for one asset."""
         buf = bytearray(self.dec_data)
-        struct.pack_into('<I', buf, asset._ai_toc, new_idx)
-        struct.pack_into('<I', buf, asset._ao_toc, new_off)
-        struct.pack_into('<I', buf, asset._sz_toc, new_sz)
+        struct.pack_into('<I', buf, asset._ai_toc, new_arch_idx)
+        struct.pack_into('<I', buf, asset._ao_toc, new_offset)
+        struct.pack_into('<I', buf, asset._sz_toc, new_size)
         self.dec_data = bytes(buf)
+
+    def add_archive_entry(self, name):
+        """
+        Append a new ArchiveFileEntry to the ArchiveFiles section.
+        Returns the new archive index.
+        New entry: flag=2, unk04=0xCCCC, unk06=1, name=name
+        (matches ArchiveDirectory.SaveArchives() in InsomniacArchive)
+        """
+        arch_off, arch_sz = self._secs[SEC_ARCH_FILES]
+        new_idx = arch_sz // ARCH_STRIDE  # current count = new index
+
+        # Build new 72-byte entry
+        entry = bytearray(ARCH_STRIDE)
+        struct.pack_into('<H', entry, 0, PATCH_FLAG)     # flag = 2
+        entry[2] = 0; entry[3] = 0
+        struct.pack_into('<H', entry, 4, PATCH_UNK04)    # unk04 = 0xCCCC
+        struct.pack_into('<H', entry, 6, PATCH_UNK06)    # unk06 = 1
+        nb = name.encode('ascii')[:63]
+        entry[8:8+len(nb)] = nb
+        entry[8+len(nb)] = 0
+
+        # Insert new entry bytes into dec_data right after current arch section
+        insert_pos = arch_off + arch_sz
+        buf = bytearray(self.dec_data)
+        buf[insert_pos:insert_pos] = bytes(entry)
+
+        # All offsets after insert_pos need to shift by ARCH_STRIDE
+        shift = ARCH_STRIDE
+        # Update section header for SEC_ARCH_FILES (size += ARCH_STRIDE)
+        nsec = struct.unpack_from('<I', buf, 12)[0]
+        for i in range(nsec):
+            base = 16 + i*12
+            h = struct.unpack_from('<I', buf, base)[0]
+            o = struct.unpack_from('<I', buf, base+4)[0]
+            s = struct.unpack_from('<I', buf, base+8)[0]
+            if h == SEC_ARCH_FILES:
+                struct.pack_into('<I', buf, base+8, s + shift)
+            elif o > arch_off:  # section starts after insertion point → shift offset
+                struct.pack_into('<I', buf, base+4, o + shift)
+
+        # Update total size in DAT1 header (byte 8)
+        old_size = struct.unpack_from('<I', buf, 8)[0]
+        struct.pack_into('<I', buf, 8, old_size + shift)
+
+        self.dec_data = bytes(buf)
+
+        # Rebuild _secs cache
+        nsec2 = struct.unpack_from('<I', self.dec_data, 12)[0]
+        self._secs = {}
+        for i in range(nsec2):
+            base = 16 + i*12
+            h = struct.unpack_from('<I', self.dec_data, base)[0]
+            o = struct.unpack_from('<I', self.dec_data, base+4)[0]
+            s = struct.unpack_from('<I', self.dec_data, base+8)[0]
+            self._secs[h] = (o, s)
+
+        # Rebuild asset offset cache (they may have shifted)
+        arch_off2 = self._secs[SEC_ARCH_FILES][0]
+        asid_off2 = self._secs[SEC_NAME_HASH][0]
+        size_off2 = self._secs[SEC_FILE_CHUNK][0]
+        oe_off2   = self._secs[SEC_CHUNK_INFO][0]
+        for a in self.assets:
+            sp = size_off2 + a._toc_idx*12
+            _, _, chunk_idx = struct.unpack_from('<III', self.dec_data, sp)
+            op = oe_off2 + chunk_idx*8
+            a._ai_toc = op
+            a._ao_toc = op + 4
+            a._sz_toc = sp + 4
+
+        self.archives.append(name)
+        return new_idx
 
     def save(self, path):
         with open(path, 'wb') as f: f.write(_toc_compress(self.dec_data))
@@ -187,7 +282,6 @@ class TOC:
 # ---------------------------------------------------------------------------
 # Archive reader
 # ---------------------------------------------------------------------------
-
 class ArchiveReader:
     def __init__(self, archive_dir):
         self.archive_dir = archive_dir
@@ -205,16 +299,16 @@ class ArchiveReader:
         self._fh.clear()
 
     def read_asset(self, asset, archives):
-        """Return full on-disk bytes (36-byte PC wrapper + DAT1 payload)."""
+        """Return full on-disk bytes (wrapper + payload)."""
         fh = self._open(archives[asset.archive_index])
         fh.seek(asset.archive_offset)
         data = fh.read(asset.file_size)
         if len(data) != asset.file_size:
-            raise IOError(f"Short read: {len(data)}/{asset.file_size} from {archives[asset.archive_index]}")
+            raise IOError(f"Short read: {len(data)}/{asset.file_size}")
         return data
 
     def read_asset_payload(self, asset, archives):
-        """Return DAT1 payload only (strips 36-byte PC wrapper if present)."""
+        """Return DAT1 payload only (strips PC wrapper if present)."""
         data = self.read_asset(asset, archives)
         if len(data) >= 4 and struct.unpack_from('<I', data, 0)[0] == PC_ASSET_MAGIC:
             return data[PC_HEADER_SIZE:]
@@ -224,9 +318,7 @@ class ArchiveReader:
 # ---------------------------------------------------------------------------
 # DAG parser
 # ---------------------------------------------------------------------------
-
 def load_dag(path):
-    """Parse DAG → {crc64_hash: path_string}. Note: CRC-64 may not match PC IDs."""
     with open(path, 'rb') as f: raw = f.read()
     if struct.unpack_from('<I', raw, 0)[0] != DAG_MAGIC:
         raise ValueError(f"Bad DAG magic: {struct.unpack_from('<I',raw,0)[0]:#010x}")
@@ -241,22 +333,17 @@ def load_dag(path):
         if not (0x20 <= dec[pos] <= 0x7E): break
         try: end = dec.index(b'\x00', pos)
         except ValueError: break
-        name = dec[pos:end].decode('ascii', 'replace')
+        name = dec[pos:end].decode('ascii','replace')
         db[compute_hash(name)] = name
         pos = end + 1
     return db
 
 
 # ---------------------------------------------------------------------------
-# Hash DB (supports both formats)
+# Hash DB
 # ---------------------------------------------------------------------------
-
 def load_hashdb(path):
-    """
-    Load asset name DB.  Two formats supported:
-      Tab-separated  :  0x<hex>\\t<path>         (this tool's format)
-      C# SMPCTool    :  <path>,<decimal_uint64>  (AssetHashes.txt from Phew/SMPCTool-src)
-    """
+    """Supports tab-separated (our format) and CSV (Phew/SMPCTool-src AssetHashes.txt)."""
     db = {}
     if not path or not os.path.isfile(path): return db
     with open(path, encoding='utf-8', errors='replace') as f:
@@ -276,108 +363,207 @@ def load_hashdb(path):
 
 
 # ---------------------------------------------------------------------------
-# Localization helpers
+# Localization — using section IDs from LocalizationFile.cs
 # ---------------------------------------------------------------------------
 
-def _parse_loc_dat1(dat1):
+def _parse_dat1_sections(data):
     """
-    Parse a .localization DAT1 block.
-    Returns (keys, values, sec_map) where:
-      keys   : list[str]   — ASCII string keys in order
-      values : list[str]   — translated values in order (UTF-8)
-      sec_map: dict        — {LOC_SEC_*: (offset, size)} for rebuilding
+    Parse DAT1 block. Returns (sections_dict, string_literals, data_start).
+    sections_dict: {hash: (offset, size)}
+    string_literals: list of embedded string literals after section headers
     """
-    if struct.unpack_from('<I', dat1, 0)[0] != DAT1_MAGIC:
+    if struct.unpack_from('<I', data, 0)[0] != DAT1_MAGIC:
         raise ValueError("Not a DAT1 block")
-    nsec = struct.unpack_from('<I', dat1, 12)[0]
-    secs = {struct.unpack_from('<III', dat1, 16+i*12)[0]:
-            (struct.unpack_from('<III', dat1, 16+i*12)[1],
-             struct.unpack_from('<III', dat1, 16+i*12)[2])
-            for i in range(nsec)}
+    nsec = struct.unpack_from('<I', data, 12)[0]
+    secs = {}
+    for i in range(nsec):
+        base = 16 + i*12
+        h = struct.unpack_from('<I', data, base)[0]
+        o = struct.unpack_from('<I', data, base+4)[0]
+        s = struct.unpack_from('<I', data, base+8)[0]
+        secs[h] = (o, s)
 
-    if LOC_SEC_KEYS not in secs or LOC_SEC_VALUES not in secs or LOC_SEC_OFFSETS not in secs:
-        raise ValueError("Missing required localization sections in DAT1")
-
-    # Keys
-    k_off, k_sz = secs[LOC_SEC_KEYS]
-    k_data = dat1[k_off:k_off+k_sz]
-    keys = []
-    pos = 0
-    while pos < len(k_data):
-        if k_data[pos] == 0: pos += 1; continue
-        end = k_data.index(b'\x00', pos)
-        keys.append(k_data[pos:end].decode('ascii', 'replace'))
+    # String literals: null-terminated strings after section headers, until empty
+    pos = 16 + nsec*12
+    literals = []
+    while pos < len(data):
+        try: end = data.index(b'\x00', pos)
+        except ValueError: break
+        s = data[pos:end].decode('utf-8','replace')
         pos = end + 1
+        if not s: break
+        literals.append(s)
 
-    # Values via offset table
-    v_off, v_sz = secs[LOC_SEC_VALUES]
-    v_data = dat1[v_off:v_off+v_sz]
-    o_off, o_sz = secs[LOC_SEC_OFFSETS]
-    values = []
-    for i in range(len(keys)):
-        if o_off + i*4 + 4 > len(dat1): values.append(''); continue
-        vptr = struct.unpack_from('<I', dat1, o_off + i*4)[0]
-        if vptr >= len(v_data) or v_data[vptr] == 0:
-            values.append('')
-        else:
-            end = v_data.index(b'\x00', vptr)
-            values.append(v_data[vptr:end].decode('utf-8', 'replace'))
-
-    return keys, values, secs, dat1
+    return secs, literals
 
 
-def _rebuild_loc_dat1(dat1_orig, keys, new_values, secs):
+def _get_dat1_from_asset(data):
     """
-    Rebuild DAT1 block with new translated values.
-    Reconstructs the value string section and updates offset table.
-    All other sections (hash tables, etc.) are preserved as-is.
+    Strip PC wrapper if present and return raw DAT1 bytes.
+    Works for:
+      - Raw DAT1 (starts with 0x44415431)
+      - PC-wrapped asset (starts with 0x122BB0AB, DAT1 at offset 0x24)
+      - PS4-wrapped asset (starts with 0xBA20AFB5, DAT1 at offset 4)
     """
-    # Build new value blob
-    new_v_blob = b'\x00'  # INVALID = empty at offset 0
-    new_offsets = []
-    for val in new_values:
-        enc = val.encode('utf-8') if val else b''
-        if not enc:
-            new_offsets.append(0)
+    if len(data) < 4: raise ValueError("File too small")
+    magic = struct.unpack_from('<I', data, 0)[0]
+    if magic == DAT1_MAGIC:
+        return data, None          # raw DAT1, no wrapper
+    elif magic == PC_ASSET_MAGIC:
+        asset_id = struct.unpack_from('<I', data, 0)[0]
+        return data[PC_HEADER_SIZE:], ('pc', asset_id)
+    elif magic == PS4_ASSET_MAGIC:
+        return data[4:], ('ps4', None)
+    else:
+        raise ValueError(f"Unknown asset magic: {magic:#010x}")
+
+
+def _wrap_asset(dat1, wrapper_info):
+    """Re-wrap DAT1 bytes with original wrapper format."""
+    if wrapper_info is None:
+        return dat1  # raw DAT1
+    kind, asset_id = wrapper_info
+    if kind == 'pc':
+        hdr = struct.pack('<I', PC_ASSET_MAGIC) + struct.pack('<I', len(dat1)) + b'\x00' * 28
+        return hdr + dat1
+    elif kind == 'ps4':
+        return struct.pack('<I', PS4_ASSET_MAGIC) + dat1
+    return dat1
+
+
+def _getstr_utf8(blob, offset):
+    """Read null-terminated UTF-8 string from blob at offset."""
+    if offset < 0 or offset >= len(blob) or blob[offset] == 0:
+        return ''
+    try:
+        end = blob.index(b'\x00', offset)
+        return blob[offset:end].decode('utf-8', 'replace')
+    except ValueError:
+        return blob[offset:].decode('utf-8', 'replace')
+
+
+def loc_extract_strings(data):
+    """
+    Extract all key→value pairs from a localization asset.
+    Returns (pairs: list[(key,value)], secs, dat1, wrapper_info)
+    """
+    dat1, wrapper_info = _get_dat1_from_asset(data)
+
+    # Verify signature
+    secs, literals = _parse_dat1_sections(dat1)
+    if not literals or literals[0] != LOC_SIGNATURE:
+        raise ValueError(f"Not a localization file (signature: {literals[:1]})")
+
+    required = [LOC_KEY_DATA, LOC_KEY_OFF, LOC_VAL_DATA, LOC_VAL_OFF, LOC_COUNT]
+    missing = [f'{h:#010x}' for h in required if h not in secs]
+    if missing:
+        raise ValueError(f"Missing localization sections: {missing}")
+
+    n_keys = struct.unpack_from('<I', dat1, secs[LOC_COUNT][0])[0]
+
+    kd_off, kd_sz = secs[LOC_KEY_DATA]
+    ko_off        = secs[LOC_KEY_OFF][0]
+    vd_off, vd_sz = secs[LOC_VAL_DATA]
+    vo_off        = secs[LOC_VAL_OFF][0]
+
+    kd = dat1[kd_off:kd_off+kd_sz]
+    vd = dat1[vd_off:vd_off+vd_sz]
+
+    pairs = []
+    for i in range(n_keys):
+        k_ptr = struct.unpack_from('<i', dat1, ko_off + i*4)[0]
+        v_ptr = struct.unpack_from('<i', dat1, vo_off + i*4)[0]
+        key   = _getstr_utf8(kd, k_ptr)
+        value = _getstr_utf8(vd, v_ptr)
+        pairs.append((key, value))
+
+    return pairs, secs, dat1, wrapper_info
+
+
+def loc_rebuild_dat1(dat1_orig, secs, new_pairs):
+    """
+    Rebuild DAT1 with new key→value pairs.
+    Only replaces LOC_VAL_DATA and LOC_VAL_OFF sections.
+    All other sections (hash tables, key data, etc.) are preserved unchanged.
+    """
+    # Build new value blob + offsets
+    new_vd = bytearray()
+    new_vo = []
+    orig_kd = dat1_orig[secs[LOC_KEY_DATA][0] : secs[LOC_KEY_DATA][0] + secs[LOC_KEY_DATA][1]]
+    orig_ko = secs[LOC_KEY_OFF][0]
+    n_keys  = struct.unpack_from('<I', dat1_orig, secs[LOC_COUNT][0])[0]
+
+    # INVALID key (index 0) always maps to offset 0 = empty string
+    new_vd.extend(b'\x00')  # empty string sentinel at offset 0
+
+    for i, (key, value) in enumerate(new_pairs):
+        if key == 'INVALID' or not value:
+            new_vo.append(0)
         else:
-            new_offsets.append(len(new_v_blob))
-            new_v_blob += enc + b'\x00'
+            new_vo.append(len(new_vd))
+            new_vd.extend(value.encode('utf-8') + b'\x00')
 
-    # Rebuild: replace value section and offset table in-place
-    # We need to adjust section offsets if sizes change
-    # Strategy: rebuild entire DAT1 with updated sections
+    new_vd_bytes = bytes(new_vd)
+    new_vo_bytes = struct.pack(f'<{len(new_vo)}i', *new_vo)
 
+    # Rebuild DAT1: replace only LOC_VAL_DATA and LOC_VAL_OFF, keep everything else
     nsec = struct.unpack_from('<I', dat1_orig, 12)[0]
     sec_headers = []
     for i in range(nsec):
-        h, o, s = struct.unpack_from('<III', dat1_orig, 16+i*12)
-        sec_headers.append([h, o, s])
+        base = 16 + i*12
+        h = struct.unpack_from('<I', dat1_orig, base)[0]
+        o = struct.unpack_from('<I', dat1_orig, base+4)[0]
+        s = struct.unpack_from('<I', dat1_orig, base+8)[0]
+        sec_headers.append((h, o, s))
 
-    # Collect original section data, replace changed sections
-    orig_sections = {}
+    # Collect section data (replace updated sections)
+    sec_data = {}
     for h, o, s in sec_headers:
-        orig_sections[h] = dat1_orig[o:o+s]
+        if h == LOC_VAL_DATA:
+            sec_data[h] = new_vd_bytes
+        elif h == LOC_VAL_OFF:
+            sec_data[h] = new_vo_bytes
+        else:
+            sec_data[h] = dat1_orig[o:o+s]
 
-    orig_sections[LOC_SEC_VALUES] = new_v_blob
-    orig_sections[LOC_SEC_OFFSETS] = struct.pack(f'<{len(new_offsets)}I', *new_offsets)
+    # Calculate header size: DAT1 header (16) + nsec*12 + string literals
+    # Find string literal area from original
+    lit_start = 16 + nsec*12
+    lit_end   = lit_start
+    while lit_end < len(dat1_orig):
+        try: end = dat1_orig.index(b'\x00', lit_end)
+        except ValueError: break
+        s_lit = dat1_orig[lit_end:end].decode('utf-8','replace')
+        lit_end = end + 1
+        if not s_lit: break
 
-    # Recalculate layout: header(16) + nsec*12 + section_data
-    HDR_SIZE = 16 + nsec * 12
-    cur_off = HDR_SIZE
-    new_sec_headers = []
+    literal_bytes = dat1_orig[lit_start:lit_end]
+    hdr_size = lit_end  # everything before section data
+
+    # Layout sections in original order (sorted by original offset)
+    ordered = sorted(sec_headers, key=lambda x: x[1])
     new_section_data = b''
-    for h, o, s in sec_headers:
-        data = orig_sections[h]
-        new_sec_headers.append((h, cur_off, len(data)))
-        new_section_data += data
-        cur_off += len(data)
+    new_sec_headers = []
+    cur_off = hdr_size
+
+    for h, _, _ in ordered:
+        data_chunk = sec_data[h]
+        new_sec_headers.append((h, cur_off, len(data_chunk)))
+        new_section_data += data_chunk
+        cur_off += len(data_chunk)
 
     # Build final DAT1
-    dat1_header = dat1_orig[:16]  # magic, parent_ref, size placeholder, nsec
-    sec_header_bytes = b''.join(struct.pack('<III', h, o, s) for h, o, s in new_sec_headers)
-    new_dat1 = dat1_header + sec_header_bytes + new_section_data
-    # Update dec_size field (byte 8)
-    new_dat1 = new_dat1[:8] + struct.pack('<I', len(new_dat1)) + new_dat1[12:]
+    # Header: magic, hash(parent_ref), total_size, nsec
+    magic_bytes   = dat1_orig[:4]
+    parent_bytes  = dat1_orig[4:8]
+    nsec_bytes    = struct.pack('<I', nsec)
+    total_size    = struct.pack('<I', hdr_size + len(new_section_data))
+
+    # Section headers sorted by ID for binary search (as in DatFileBase.Save())
+    sorted_hdrs = sorted(new_sec_headers, key=lambda x: x[0])
+    hdr_bytes = b''.join(struct.pack('<III', h, o, s) for h, o, s in sorted_hdrs)
+
+    new_dat1 = magic_bytes + parent_bytes + total_size + nsec_bytes + hdr_bytes + literal_bytes + new_section_data
     return new_dat1
 
 
@@ -385,13 +571,13 @@ def _rebuild_loc_dat1(dat1_orig, keys, new_values, secs):
 # Commands
 # ---------------------------------------------------------------------------
 
-def _get_toc(args):
+def _load_toc(args):
     db = load_hashdb(getattr(args, 'hashdb', None))
     return TOC.load(args.toc, db)
 
 
 def cmd_info(args):
-    toc = _get_toc(args)
+    toc = _load_toc(args)
     counts = defaultdict(int)
     for a in toc.assets: counts[a.archive_index] += 1
     print(f"Archives : {len(toc.archives)}")
@@ -405,9 +591,9 @@ def cmd_info(args):
 
 
 def cmd_list(args):
-    toc = _get_toc(args)
-    filt      = (getattr(args, 'filter',  None) or '').lower()
-    arch_filt = (getattr(args, 'archive', None) or '').lower()
+    toc = _load_toc(args)
+    filt      = (getattr(args,'filter', None) or '').lower()
+    arch_filt = (getattr(args,'archive',None) or '').lower()
     try:
         for a in toc.assets:
             arch = toc.archives[a.archive_index] if a.archive_index < len(toc.archives) else '?'
@@ -421,20 +607,19 @@ def cmd_list(args):
 
 
 def cmd_extract(args):
-    toc = _get_toc(args)
+    toc = _load_toc(args)
     skip_hex = getattr(args, 'skip_hex', False)
     os.makedirs(args.output, exist_ok=True)
     assets = toc.by_archive(args.archive)
     if not assets:
-        print(f"[!] No assets found for archive '{args.archive}'.")
+        print(f"[!] Archive '{args.archive}' not found or has no assets.")
         print(f"    Available: {', '.join(dict.fromkeys(toc.archives))}")
         return
     reader = ArchiveReader(args.archive_dir)
     ok = err = skipped = 0
     try:
         for a in assets:
-            if skip_hex and a.filename.startswith('0x'):
-                skipped += 1; continue
+            if skip_hex and a.filename.startswith('0x'): skipped += 1; continue
             try:
                 data = reader.read_asset_payload(a, toc.archives)
                 safe = a.filename.replace('/', os.sep).replace('\\', os.sep)
@@ -450,12 +635,12 @@ def cmd_extract(args):
 
 
 def cmd_repack(args):
-    """Rebuild archive from original game files (byte-identical if unmodified)."""
-    toc = _get_toc(args)
+    """Rebuild archive from original files (byte-identical if unmodified)."""
+    toc = _load_toc(args)
     skip_hex = getattr(args, 'skip_hex', False)
     assets = toc.by_archive(args.archive)
     if not assets:
-        print(f"[!] No assets found for archive '{args.archive}'."); return
+        print(f"[!] Archive '{args.archive}' not found."); return
     if skip_hex:
         assets = [a for a in assets if not a.filename.startswith('0x')]
     assets = sorted(assets, key=lambda a: a.archive_offset)
@@ -469,90 +654,145 @@ def cmd_repack(args):
                     data = reader.read_asset(a, toc.archives)
                     new_off = out.tell()
                     out.write(data)
-                    toc.patch_redirect(a, a.archive_index, new_off, len(data))
+                    toc.patch_asset(a, a.archive_index, new_off, len(data))
                     ok += 1
                 except Exception as e:
                     print(f"[ERR] {a.filename}: {e}", file=sys.stderr); err += 1
     finally:
         reader.close_all()
     toc.save(args.output_toc)
-    print(f"Written {ok} assets  Errors {err}")
-    print(f"New TOC -> {args.output_toc}")
+    print(f"Written {ok}  Errors {err}\nNew TOC -> {args.output_toc}")
 
 
-def cmd_repack_dir(args):
+def cmd_patch(args):
     """
-    Repack from a directory of extracted assets.
-    Matches filenames against TOC; supports language-suffix archives (a00s034.us etc).
+    Create a new patch.archive containing only modified/added assets.
+    Adds a new ArchiveFileEntry to TOC and redirects patched assets to new archive.
+    Based on ArchiveDirectory.SaveArchives() from team-waldo/InsomniacArchive.
+
+    Usage:
+      --replace <asset_name_or_id>:<file>  (repeat for multiple assets)
+      --replace-dir <dir>  scan dir for files matching asset names
     """
-    toc = _get_toc(args)
-    assets = toc.by_archive(args.archive)
-    if not assets:
-        print(f"[!] No assets found for archive '{args.archive}'."); return
-    assets = sorted(assets, key=lambda a: a.archive_offset)
+    toc = _load_toc(args)
+    reader = ArchiveReader(args.archive_dir)
 
-    ok = err = unchanged = 0
-    print(f"Repacking from dir '{args.src_dir}' -> {args.output_archive}")
+    # Collect replacements: list of (AssetEntry, bytes)
+    replacements = []
 
-    orig_reader = ArchiveReader(args.archive_dir)
+    # --replace name_or_id:file
+    for spec in (getattr(args, 'replace', None) or []):
+        if ':' not in spec:
+            print(f"[!] Invalid --replace spec '{spec}' (expected name:file)"); continue
+        key, filepath = spec.split(':', 1)
+        if not os.path.isfile(filepath):
+            print(f"[!] File not found: {filepath}"); continue
+        with open(filepath, 'rb') as f: new_data = f.read()
+
+        # Find asset by ID or name
+        matched = []
+        try:
+            asset_id = int(key, 16)
+            matched = toc.find_by_id(asset_id)
+        except ValueError:
+            matched = toc.find_by_filename(key)
+
+        if not matched:
+            print(f"[!] Asset not found: {key!r}"); continue
+        for a in matched:
+            replacements.append((a, new_data))
+            print(f"  Replace: {a.filename!r} ({a.file_size:,} -> {len(new_data):,} bytes)")
+
+    # --replace-dir dir
+    src_dir = getattr(args, 'replace_dir', None)
+    if src_dir and os.path.isdir(src_dir):
+        for root, _, files in os.walk(src_dir):
+            for fname in files:
+                fpath = os.path.join(root, fname)
+                rel   = os.path.relpath(fpath, src_dir).replace('\\', '/')
+                matched = toc.find_by_filename(rel)
+                if not matched: continue
+                with open(fpath, 'rb') as f: new_data = f.read()
+                for a in matched:
+                    replacements.append((a, new_data))
+                    print(f"  Replace: {a.filename!r}")
+
+    if not replacements:
+        print("[!] No replacements specified. Use --replace or --replace-dir.")
+        return
+
+    # Deduplicate: if same asset_id appears multiple times, keep only one per asset_id
+    # (prefer patch.archive entries; otherwise take first match)
+    seen_ids = {}
+    deduped = []
+    for a, nd in replacements:
+        if a.asset_id not in seen_ids:
+            seen_ids[a.asset_id] = (a, nd)
+        else:
+            # prefer patch.archive entries (flag=2)
+            prev_a, _ = seen_ids[a.asset_id]
+            if a.archive_index > prev_a.archive_index:  # later = patch archive
+                seen_ids[a.asset_id] = (a, nd)
+    replacements = list(seen_ids.values())
+
+    # Add new patch archive entry to TOC
+    new_arch_name = getattr(args, 'output_archive_name', None) or 'patch.archive'
+    new_arch_idx = toc.add_archive_entry(new_arch_name)
+    print(f"\nNew archive entry: [{new_arch_idx}] {new_arch_name!r}")
+
+    # Write new patch archive + update TOC
+    os.makedirs(os.path.dirname(os.path.abspath(args.output_archive)), exist_ok=True)
+    ok = 0
     try:
         with open(args.output_archive, 'wb') as out:
-            for a in assets:
+            for a, new_data in replacements:
                 new_off = out.tell()
-                # Try to find replacement file in src_dir
-                safe = a.filename.replace('/', os.sep).replace('\\', os.sep)
-                candidate = os.path.join(args.src_dir, safe)
-                if os.path.isfile(candidate):
-                    # Load replacement and re-wrap with PC header
-                    with open(candidate, 'rb') as f: payload = f.read()
-                    # If the file starts with DAT1 magic, re-wrap it
-                    if len(payload) >= 4 and struct.unpack_from('<I', payload, 0)[0] == DAT1_MAGIC:
-                        wrapper = struct.pack('<I', PC_ASSET_MAGIC) + \
-                                  struct.pack('<I', len(payload)) + b'\x00' * 28
-                        data = wrapper + payload
-                    else:
-                        data = payload  # raw asset (GFX etc), no wrapper
-                    out.write(data)
-                    toc.patch_redirect(a, a.archive_index, new_off, len(data))
-                    ok += 1
+                # Determine if asset needs PC wrapper:
+                # If new_data is raw DAT1, wrap it. If already wrapped or raw binary, use as-is.
+                new_magic = struct.unpack_from('<I', new_data, 0)[0] if len(new_data) >= 4 else 0
+                if new_magic == DAT1_MAGIC:
+                    # Raw DAT1 payload — wrap with PC header
+                    hdr = struct.pack('<I', PC_ASSET_MAGIC) + struct.pack('<I', len(new_data)) + b'\x00'*28
+                    write_data = hdr + new_data
+                elif new_magic == PS4_ASSET_MAGIC:
+                    # PS4 format — strip PS4 magic, wrap with PC header
+                    dat1 = new_data[4:]
+                    hdr = struct.pack('<I', PC_ASSET_MAGIC) + struct.pack('<I', len(dat1)) + b'\x00'*28
+                    write_data = hdr + dat1
                 else:
-                    # Keep original
-                    try:
-                        data = orig_reader.read_asset(a, toc.archives)
-                        out.write(data)
-                        toc.patch_redirect(a, a.archive_index, new_off, len(data))
-                        unchanged += 1
-                    except Exception as e:
-                        print(f"[ERR] {a.filename}: {e}", file=sys.stderr); err += 1
+                    # Already PC-wrapped or raw binary (GFX etc) — use as-is
+                    write_data = new_data
+                out.write(write_data)
+                toc.patch_asset(a, new_arch_idx, new_off, len(write_data))
+                ok += 1
     finally:
-        orig_reader.close_all()
+        reader.close_all()
 
     toc.save(args.output_toc)
-    print(f"Replaced {ok}  Unchanged {unchanged}  Errors {err}")
+    print(f"Patched {ok} assets -> {args.output_archive}")
     print(f"New TOC -> {args.output_toc}")
+    print("Copy both files to your asset_archive directory (keep backups!)")
 
 
 def cmd_csv(args):
-    toc = _get_toc(args)
+    toc = _load_toc(args)
     with open(args.output, 'w', newline='', encoding='utf-8') as f:
         w = csv_mod.writer(f)
-        w.writerow(['asset_id', 'filename', 'archive', 'archive_offset', 'file_size'])
+        w.writerow(['asset_id','filename','archive','archive_offset','file_size'])
         for a in toc.assets:
             arch = toc.archives[a.archive_index] if a.archive_index < len(toc.archives) else ''
-            w.writerow([f'{a.asset_id:#018x}', a.filename, arch,
-                        a.archive_offset, a.file_size])
+            w.writerow([f'{a.asset_id:#018x}', a.filename, arch, a.archive_offset, a.file_size])
     print(f"Exported {len(toc.assets):,} rows -> {args.output}")
 
 
 def cmd_build_hashdb(args):
-    """Build hash DB from DAG file (CRC-64). Note: may not match all PC asset IDs."""
     print("Building hash DB from DAG...")
     db = load_dag(args.dag)
     with open(args.output, 'w', encoding='utf-8') as f:
         for h, name in sorted(db.items(), key=lambda x: x[1]):
             f.write(f'{h:#018x}\t{name}\n')
     print(f"Written {len(db):,} entries -> {args.output}")
-    print("TIP: For better coverage, use AssetHashes.txt from github.com/Phew/SMPCTool-src")
+    print("TIP: For better coverage use AssetHashes.txt from github.com/Phew/SMPCTool-src")
 
 
 def cmd_hash(args):
@@ -563,11 +803,11 @@ def cmd_hash(args):
 def cmd_dag(args):
     print("Loading DAG...", file=sys.stderr)
     db = load_dag(args.dag)
-    filt  = (getattr(args, 'filter', None) or '').lower()
+    filt  = (getattr(args,'filter',None) or '').lower()
     names = sorted(n for n in db.values() if filt in n.lower())
-    if getattr(args, 'export', None):
-        with open(args.export, 'w', encoding='utf-8') as f:
-            for n in names: f.write(n + '\n')
+    if getattr(args,'export',None):
+        with open(args.export,'w',encoding='utf-8') as f:
+            for n in names: f.write(n+'\n')
         print(f"Exported {len(names):,} names -> {args.export}")
     else:
         try:
@@ -579,197 +819,211 @@ def cmd_dag(args):
 
 def cmd_loc_export(args):
     """
-    Export a .localization asset to CSV for translation.
-
-    CSV columns: key, value
-    The asset file should be extracted first with the extract command.
+    Export .localization asset to 3-column CSV: key, source, translation
+    (Compatible with team-waldo/InsomniacArchive SpidermanLocalizationTool format)
     """
-    with open(args.asset, 'rb') as f: data = f.read()
+    with open(args.asset,'rb') as f: data = f.read()
+    pairs, _, _, _ = loc_extract_strings(data)
 
-    # Strip PC wrapper if present
-    if len(data) >= 4 and struct.unpack_from('<I', data, 0)[0] == PC_ASSET_MAGIC:
-        dat1 = data[PC_HEADER_SIZE:]
-    else:
-        dat1 = data
-
-    keys, values, _, _ = _parse_loc_dat1(dat1)
-    out_path = args.output
-
-    with open(out_path, 'w', newline='', encoding='utf-8-sig') as f:
+    with open(args.output,'w',newline='',encoding='utf-8-sig') as f:
         w = csv_mod.writer(f)
-        w.writerow(['key', 'value'])
-        for k, v in zip(keys, values):
-            w.writerow([k, v])
+        w.writerow(['key','source','translation'])
+        for key, value in pairs:
+            w.writerow([key, value, ''])   # translation column left blank for translator
 
-    print(f"Exported {len(keys):,} strings -> {out_path}")
-    print("Edit the 'value' column, then use loc-import to apply.")
+    print(f"Exported {len(pairs):,} strings -> {args.output}")
+    print("Fill in the 'translation' column, then use loc-import.")
 
 
 def cmd_loc_import(args):
     """
-    Import translated CSV back into a .localization asset.
-
-    Reads key→value from CSV, rebuilds the DAT1 value section,
-    and writes a new asset file ready for repack.
+    Import translated CSV back into .localization asset.
+    CSV format: key, source, translation  (translation column replaces value)
     """
-    # Load translated CSV
-    new_vals_map = {}
-    with open(args.csv, 'r', newline='', encoding='utf-8-sig') as f:
-        for row in csv_mod.DictReader(f):
-            if 'key' in row and 'value' in row:
-                new_vals_map[row['key']] = row['value']
+    # Load translations from CSV (column 2 = translation)
+    tr = {}
+    with open(args.csv,'r',newline='',encoding='utf-8-sig') as f:
+        reader = csv_mod.reader(f)
+        header = next(reader, None)
+        for row in reader:
+            if len(row) < 3: continue
+            key, src, trans = row[0], row[1], row[2]
+            if trans.strip():  # only import non-empty translations
+                tr[key] = trans
 
-    with open(args.asset, 'rb') as f: data = f.read()
-    has_wrapper = len(data) >= 4 and struct.unpack_from('<I', data, 0)[0] == PC_ASSET_MAGIC
-    dat1 = data[PC_HEADER_SIZE:] if has_wrapper else data
+    print(f"Loaded {len(tr):,} translations from {args.csv}")
 
-    keys, orig_values, secs, _ = _parse_loc_dat1(dat1)
+    with open(args.asset,'rb') as f: data = f.read()
+    pairs, secs, dat1, wrapper_info = loc_extract_strings(data)
 
-    # Build new value list: use translated value if available, else keep original
-    new_values = []
+    # Merge translations
+    new_pairs = []
     replaced = unchanged = 0
-    for k, orig in zip(keys, orig_values):
-        if k in new_vals_map and new_vals_map[k] != orig:
-            new_values.append(new_vals_map[k])
+    for key, orig_value in pairs:
+        if key in tr:
+            new_pairs.append((key, tr[key]))
             replaced += 1
         else:
-            new_values.append(orig)
+            new_pairs.append((key, orig_value))
             unchanged += 1
 
-    new_dat1 = _rebuild_loc_dat1(dat1, keys, new_values, secs)
+    new_dat1 = loc_rebuild_dat1(dat1, secs, new_pairs)
+    out_data  = _wrap_asset(new_dat1, wrapper_info)
 
-    # Re-wrap with PC header if original had it
-    if has_wrapper:
-        wrapper = (struct.pack('<I', PC_ASSET_MAGIC) +
-                   struct.pack('<I', len(new_dat1)) + b'\x00' * 28)
-        output_data = wrapper + new_dat1
+    with open(args.output,'wb') as f: f.write(out_data)
+    print(f"Replaced {replaced:,}  Unchanged {unchanged:,} -> {args.output}")
+    print("Use 'patch' command to apply to game archives.")
+
+
+def cmd_loc_convert(args):
+    """
+    Convert .localization asset between PC and PS4 format.
+    PC  -> PS4 : strip PC header (0x24 bytes), prepend PS4 magic (0xBA20AFB5)
+    PS4 -> PC  : strip PS4 magic (4 bytes), prepend PC header with asset_id from --asset-id
+    Auto-detect if --mode not specified.
+
+    PC format (in archive): 0x122BB0AB + rawsize + 0x1C zeros + DAT1
+    PC format (extracted) : DAT1 directly
+    PS4 format            : 0xBA20AFB5 + DAT1
+    """
+    with open(args.asset,'rb') as f: data = f.read()
+    magic = struct.unpack_from('<I', data, 0)[0]
+
+    mode = getattr(args,'mode',None)
+    if not mode:
+        if magic == PC_ASSET_MAGIC: mode = 'pc2ps4'
+        elif magic == PS4_ASSET_MAGIC: mode = 'ps42pc'
+        elif magic == DAT1_MAGIC: mode = 'pc2ps4'  # raw extracted PC file
+        else: raise ValueError(f"Cannot auto-detect format (magic={magic:#010x}). Use --mode.")
+
+    if mode == 'pc2ps4':
+        dat1, _ = _get_dat1_from_asset(data)
+        out_data = struct.pack('<I', PS4_ASSET_MAGIC) + dat1
+        print(f"Converted PC -> PS4 ({len(data):,} -> {len(out_data):,} bytes) -> {args.output}")
+    elif mode == 'ps42pc':
+        dat1, _ = _get_dat1_from_asset(data)
+        asset_id_raw = int(getattr(args,'asset_id','0') or '0', 0)
+        hdr = struct.pack('<I', PC_ASSET_MAGIC) + struct.pack('<I', len(dat1)) + b'\x00'*28
+        out_data = hdr + dat1
+        print(f"Converted PS4 -> PC ({len(data):,} -> {len(out_data):,} bytes) -> {args.output}")
     else:
-        output_data = new_dat1
+        raise ValueError(f"Unknown mode: {mode}")
 
-    out_path = args.output
-    with open(out_path, 'wb') as f: f.write(output_data)
-    print(f"Replaced {replaced:,} strings  Unchanged {unchanged:,} -> {out_path}")
-    print("Now use repack-dir or repack to apply to archive.")
+    with open(args.output,'wb') as f: f.write(out_data)
 
 
 def cmd_dump_archive(args):
-    """Hexdump raw bytes at offset in an archive (for debugging)."""
     offset = int(args.offset, 0)
     size   = int(args.size)
-    with open(args.archive, 'rb') as f:
+    with open(args.archive,'rb') as f:
         f.seek(offset); data = f.read(size)
     print(f"Archive: {args.archive}  offset={offset:#x}  size={size}")
     if len(data) >= 4:
-        ml = struct.unpack_from('<I', data, 0)[0]
-        mb = struct.unpack_from('>I', data, 0)[0]
+        ml = struct.unpack_from('<I',data,0)[0]
+        mb = struct.unpack_from('>I',data,0)[0]
         suffix = ''
         if ml == PC_ASSET_MAGIC:
-            psz = struct.unpack_from('<I', data, 4)[0]
-            suffix = f'  [PC wrapper payload={psz:,} total={psz+PC_HEADER_SIZE:,}]'
+            suffix = f'  [PC wrapper payload={struct.unpack_from("<I",data,4)[0]:,}]'
         print(f"Magic LE={ml:#010x}  BE={mb:#010x}{suffix}")
-    for i in range(0, min(len(data), 512), 16):
-        row = data[i:i+16]
-        h = ' '.join(f'{b:02x}' for b in row)
-        a = ''.join(chr(b) if 0x20 <= b < 0x7f else '.' for b in row)
+    for i in range(0,min(len(data),512),16):
+        row=data[i:i+16]
+        h=' '.join(f'{b:02x}' for b in row)
+        a=''.join(chr(b) if 0x20<=b<0x7f else '.' for b in row)
         print(f'  {offset+i:#010x}  {h:<48}  {a}')
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
-
 def main():
     p = argparse.ArgumentParser(
         prog='smpc_tool',
-        description='SMPCTool Python — Spider-Man PC asset tool',
+        description='SMPCTool Python — Spider-Man PC asset tool v3.0',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 examples:
-  python smpc_tool.py info --toc toc --hashdb AssetHashes.txt
-  python smpc_tool.py list --toc toc --hashdb AssetHashes.txt --filter .texture
-  python smpc_tool.py extract --toc toc --archive-dir asset_archive --archive g00s000 --output out/
-  python smpc_tool.py repack  --toc toc --archive-dir asset_archive --archive patch.archive \\
-                              --output-archive patch_new.archive --output-toc toc_new
-  python smpc_tool.py loc-export --asset out/localization/ui/ui.localization --output ui_en.csv
-  python smpc_tool.py loc-import --asset out/localization/ui/ui.localization \\
-                                 --csv ui_th.csv --output ui_th.localization
+  %(prog)s info     --toc toc --hashdb AssetHashes.txt
+  %(prog)s list     --toc toc --hashdb AssetHashes.txt --filter .texture
+  %(prog)s extract  --toc toc --archive-dir asset_archive --archive g00s000 --output out/
+  %(prog)s repack   --toc toc --archive-dir asset_archive --archive patch.archive
+                    --output-archive patch_new.archive --output-toc toc_new
+  %(prog)s patch    --toc toc --archive-dir asset_archive
+                    --replace "localization/localization_all.localization:new_loc.localization"
+                    --output-archive patch_new.archive --output-toc toc_new
+  %(prog)s loc-export  --asset localization_all.localization --output strings.csv
+  %(prog)s loc-import  --asset localization_all.localization --csv strings_th.csv --output loc_th.localization
+  %(prog)s loc-convert --asset localization_all.localization --output loc_ps4.localization
         """
     )
 
-    # Shared args
-    toc_args = argparse.ArgumentParser(add_help=False)
-    toc_args.add_argument('--toc',    required=True, metavar='TOC')
-    toc_args.add_argument('--hashdb', metavar='HASHDB',
-                          help='AssetHashes.txt (C# format) or tab-separated hash DB')
+    toc_p = argparse.ArgumentParser(add_help=False)
+    toc_p.add_argument('--toc',    required=True, metavar='TOC')
+    toc_p.add_argument('--hashdb', metavar='HASHDB',
+                       help='AssetHashes.txt (Phew/SMPCTool-src) or tab-separated hash DB')
 
     sub = p.add_subparsers(dest='cmd', required=True)
 
-    # build-hashdb
-    s = sub.add_parser('build-hashdb', help='Build hash DB from DAG  ← run this first!')
-    s.add_argument('--dag',    required=True, metavar='DAG')
-    s.add_argument('--output', required=True, metavar='OUTPUT')
+    s = sub.add_parser('build-hashdb', help='Build hash DB from DAG  ← run first!')
+    s.add_argument('--dag', required=True); s.add_argument('--output', required=True)
 
-    # info
-    s = sub.add_parser('info', help='TOC summary', parents=[toc_args])
+    s = sub.add_parser('info',  help='TOC summary', parents=[toc_p])
+    s = sub.add_parser('list',  help='List assets',  parents=[toc_p])
+    s.add_argument('--filter');  s.add_argument('--archive', metavar='ARCHIVE')
 
-    # list
-    s = sub.add_parser('list', help='List assets', parents=[toc_args])
-    s.add_argument('--filter',  metavar='FILTER', help='Substring filter on name or ID')
-    s.add_argument('--archive', metavar='ARCHIVE', help='Filter by archive name')
+    s = sub.add_parser('extract', help='Extract assets from archive', parents=[toc_p])
+    s.add_argument('--archive-dir', required=True); s.add_argument('--archive', required=True)
+    s.add_argument('--output', required=True); s.add_argument('--skip-hex', action='store_true')
 
-    # extract
-    s = sub.add_parser('extract', help='Extract assets from an archive', parents=[toc_args])
-    s.add_argument('--archive-dir', required=True, metavar='DIR')
-    s.add_argument('--archive',     required=True, metavar='ARCHIVE')
-    s.add_argument('--output',      required=True, metavar='OUTPUT')
-    s.add_argument('--skip-hex',    action='store_true', help='Skip assets with no name')
+    s = sub.add_parser('repack', help='Rebuild archive + new TOC', parents=[toc_p])
+    s.add_argument('--archive-dir', required=True); s.add_argument('--archive', required=True)
+    s.add_argument('--output-archive', required=True); s.add_argument('--output-toc', required=True)
+    s.add_argument('--skip-hex', action='store_true')
 
-    # repack
-    s = sub.add_parser('repack', help='Repack archive -> new archive + new TOC', parents=[toc_args])
-    s.add_argument('--archive-dir',     required=True, metavar='DIR')
-    s.add_argument('--archive',         required=True, metavar='ARCHIVE')
-    s.add_argument('--output-archive',  required=True, metavar='OUTPUT_ARCHIVE')
-    s.add_argument('--output-toc',      required=True, metavar='OUTPUT_TOC')
-    s.add_argument('--skip-hex',        action='store_true')
+    s = sub.add_parser('patch',
+        help='Create patch.archive with only modified assets (faster than full repack)',
+        parents=[toc_p])
+    s.add_argument('--archive-dir',   required=True, metavar='DIR')
+    s.add_argument('--output-archive', required=True, metavar='OUTPUT_ARCHIVE',
+                   help='Output patch.archive path')
+    s.add_argument('--output-toc',    required=True, metavar='OUTPUT_TOC')
+    s.add_argument('--replace', action='append', metavar='NAME:FILE',
+                   help='Replace asset: asset_name_or_hex_id:replacement_file (repeat for multiple)')
+    s.add_argument('--replace-dir', metavar='DIR',
+                   help='Scan directory for replacement assets by filename match')
+    s.add_argument('--output-archive-name', default='patch.archive',
+                   help='Name for new patch archive entry in TOC (default: patch.archive)')
 
-    # repack-dir
-    s = sub.add_parser('repack-dir', help='Repack from extracted dir (supports lang suffixes)', parents=[toc_args])
-    s.add_argument('--archive-dir',     required=True, metavar='DIR',     help='Original archive dir')
-    s.add_argument('--src-dir',         required=True, metavar='SRC_DIR', help='Directory with replacement assets')
-    s.add_argument('--archive',         required=True, metavar='ARCHIVE')
-    s.add_argument('--output-archive',  required=True, metavar='OUTPUT_ARCHIVE')
-    s.add_argument('--output-toc',      required=True, metavar='OUTPUT_TOC')
+    s = sub.add_parser('csv', help='Export asset list to CSV', parents=[toc_p])
+    s.add_argument('--output', required=True)
 
-    # csv
-    s = sub.add_parser('csv', help='Export asset list to CSV', parents=[toc_args])
-    s.add_argument('--output', required=True, metavar='OUTPUT')
-
-    # hash
     s = sub.add_parser('hash', help='Compute CRC-64 hash for a path string')
     s.add_argument('path')
 
-    # dag
-    s = sub.add_parser('dag', help='Search DAG names or export list')
-    s.add_argument('--dag',    required=True, metavar='DAG')
-    s.add_argument('--filter', metavar='FILTER')
-    s.add_argument('--export', metavar='EXPORT')
+    s = sub.add_parser('dag',  help='Search DAG names or export list')
+    s.add_argument('--dag', required=True); s.add_argument('--filter'); s.add_argument('--export')
 
-    # loc-export
-    s = sub.add_parser('loc-export', help='Export .localization asset -> CSV')
-    s.add_argument('--asset',  required=True, metavar='ASSET',  help='Extracted .localization file')
-    s.add_argument('--output', required=True, metavar='OUTPUT', help='Output CSV path')
+    s = sub.add_parser('loc-export',
+        help='Export .localization asset -> CSV (key, source, translation)')
+    s.add_argument('--asset',  required=True, metavar='ASSET')
+    s.add_argument('--output', required=True, metavar='OUTPUT')
 
-    # loc-import
-    s = sub.add_parser('loc-import', help='Import translated CSV -> .localization asset')
-    s.add_argument('--asset',  required=True, metavar='ASSET',  help='Original extracted .localization file')
-    s.add_argument('--csv',    required=True, metavar='CSV',    help='Translated CSV (from loc-export)')
-    s.add_argument('--output', required=True, metavar='OUTPUT', help='Output .localization file')
+    s = sub.add_parser('loc-import',
+        help='Import translated CSV -> .localization asset')
+    s.add_argument('--asset',  required=True); s.add_argument('--csv', required=True)
+    s.add_argument('--output', required=True)
 
-    # dump-archive
+    s = sub.add_parser('loc-convert',
+        help='Convert .localization between PC and PS4 format (auto-detect)')
+    s.add_argument('--asset',    required=True)
+    s.add_argument('--output',   required=True)
+    s.add_argument('--mode',     choices=['pc2ps4','ps42pc'],
+                   help='Conversion direction (auto-detected if omitted)')
+    s.add_argument('--asset-id', default='0', metavar='HEX',
+                   help='Asset ID for ps42pc conversion (hex, optional)')
+
     s = sub.add_parser('dump-archive', help='Hexdump bytes from archive (debug)')
     s.add_argument('--archive', required=True)
-    s.add_argument('--offset',  default='0x0')
-    s.add_argument('--size',    default='256')
+    s.add_argument('--offset', default='0x0'); s.add_argument('--size', default='256')
 
     args = p.parse_args()
     {
@@ -778,12 +1032,13 @@ examples:
         'list':         cmd_list,
         'extract':      cmd_extract,
         'repack':       cmd_repack,
-        'repack-dir':   cmd_repack_dir,
+        'patch':        cmd_patch,
         'csv':          cmd_csv,
         'hash':         cmd_hash,
         'dag':          cmd_dag,
         'loc-export':   cmd_loc_export,
         'loc-import':   cmd_loc_import,
+        'loc-convert':  cmd_loc_convert,
         'dump-archive': cmd_dump_archive,
     }[args.cmd](args)
 
