@@ -907,7 +907,10 @@ def cmd_loc_convert(args):
 
     if mode == 'pc2ps4':
         dat1, _ = _get_dat1_from_asset(data)
-        out_data = struct.pack('<I', PS4_ASSET_MAGIC) + dat1
+        # PS4 tool reads: magic(4) + rawsize(4) + pad(28) + dat1
+        # rawsize = len(dat1) when not LZ4-compressed (PS4 tool detects raw if len==rawsize)
+        hdr = struct.pack('<I', PS4_ASSET_MAGIC) + struct.pack('<I', len(dat1)) + b'\x00' * 28
+        out_data = hdr + dat1
         label = 'PC -> PS4'
     elif mode == 'ps42pc':
         dat1, _ = _get_dat1_from_asset(data)
